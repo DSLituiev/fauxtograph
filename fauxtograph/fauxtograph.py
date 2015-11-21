@@ -16,6 +16,112 @@ import tqdm
 #   TODO: unit test for pickle / depickle, c/gpu
 #   TODO: test that before training the RMSE is as random as you'd expect
 #   TODO: deccode / encode on an easy example
+#import sys
+#if len(sys.args) > 0 and sys.args[1] == "test":
+#    F = np
+
+def random_q_z( z_mean, z_logvar, family = "gauss", flag_gpu = False , test = False, n_samples = None, F=F ):
+    J = z_logvar.data.shape[-1]
+    if test:
+        F = np
+        if n_samples is not None:
+            varshape = ( n_samples, J)
+    else:
+        varshape = z_mean.data.shape
+
+    if family == "gauss":
+        # Create `latent_dim` N(0,1) normal samples.
+        z0_samples = np.random.standard_normal(varshape).astype('float32')
+        if flag_gpu:
+            z_samples = cuda.to_gpu( z0_samples)
+        if not test:
+            z0_samples = chainer.Variable( z0_samples)
+        # Scale samples to model trained parameters.
+        z_samples = z0_samples * F.exp( 0.5* z_logvar) + z_mean
+        return z_samples
+    elif family == "laplace":
+        z0_samples = np.random.laplace( 0, 1, size = varshape ).astype('float32')
+        if flag_gpu:
+            z0_samples = cuda.to_gpu(z0_samples)
+        if not test:
+            z0_samples = chainer.Variable(z0_samples)
+        z_samples = z0_samples * F.exp( z_logvar ) + z_mean
+        return z_samples
+    else:
+        raise ValueError("unknown distribution family:", family)
+
+def analytic_entropy_q_z( z_logvar, family, test = False , F = F):
+    J = z_logvar.data.shape[-1]
+    n_samples = z_logvar.data.shape[0] if len(z_logvar.data.shape) > 1 else 1
+    if test:
+        F = np
+    if family == "gauss":
+        qentropy_theoretical  = (np.log( 2 * np.pi) + 1) * J/2  + 1/2* F.sum(  z_logvar  ) / n_samples
+        #qentropy_theoretical  = np.log( 2 * np.pi)/2 + 1/2 + F.sum(  z_logvar ) / n_samples
+    elif family == "laplace":
+        qentropy_theoretical  = (np.log(2) + 1)*J + F.sum( z_logvar)/n_samples
+    else:
+        raise ValueError("unknown distribution family:", family)
+    return qentropy_theoretical
+
+def emp_entropy_q_z( z_set, z_mean, z_logvar , n_samples, family , test = False , F = F):
+    J = z_logvar.data.shape[-1]
+    n_samples = z_set.data.shape[0]
+    # n_samples_params =  z_logvar.data.shape[1] if len( z_logvar.data.shape )>1 else 1
+    if test:
+        F = np
+    if family == "gauss":
+        qentropy_emp = np.log( 2 * np.pi)* J/2 + \
+                                F.sum( z_logvar/2 + \
+                                    (z_set - z_mean )**2  / 2 / F.exp( z_logvar ) ) / n_samples
+        #qentropy_emp = np.log( 2 * np.pi)/2 + F.sum( z_logvar/2 +  (z_set - z_mean )**2  / 2 / F.exp( z_logvar ) ) / n_samples 
+    elif family == "laplace":
+ #       qentropy_emp =  F.sum( np.absolute( z_set - z_mean ) / F.exp( z_logvar ) ) / n_samples  +\
+ #               F.sum( z_logvar )/ n_samples_params +  np.log( 2 ) * J 
+        qentropy_emp =  F.sum( np.absolute( z_set - z_mean ) / F.exp( z_logvar ) +  z_logvar ) / n_samples  +\
+                            np.log( 2 ) * J 
+    else:
+        raise ValueError("unknown distribution family:", family)
+    return qentropy_emp
+
+def emp_cross_entropy_prior_z( z_set, n_samples, family,  reg_inv_coeff=1 , test = False , F = F):
+    J = np.prod(z_set.data.shape[1:])
+    n_samples = z_set.data.shape[0]
+    if test:
+        F = np
+    if family == "gauss":
+        priorxentropy =  np.log( 2* np.pi * reg_inv_coeff) * J/2 + F.sum( ( z_set)**2 )  / reg_inv_coeff**2 / n_samples
+    elif family == "laplace":
+        priorxentropy =  np.log( 2* reg_inv_coeff) * J  + F.sum( np.absolute( z_set) )  / reg_inv_coeff  / n_samples
+        # print("  sum |z_set |", F.sum( np.absolute( z_set) ).data / reg_inv_coeff  / n_samples )
+        #print("  const" , np.log( 2* reg_inv_coeff) )#* J )
+        #print("  reg_inv_coeff" ,  reg_inv_coeff )
+    else:
+        raise ValueError("unknown distribution family:", family )
+    # print(" const", np.log( 2* reg_inv_coeff) * J)
+    #print( "E(|z|/lambda )",   (F.sum( np.absolute( z_set) )  / reg_inv_coeff  / n_samples).data  )
+    return priorxentropy
+
+def analytic_cross_entropy_prior_z( z_mean, z_logvar , family,  reg_inv_coeff=1  , test = False , F = F):
+    """ does not really work so far"""
+    J = z_logvar.data.shape[-1]
+    n_samples = z_logvar.data.shape[0] if len(z_logvar.data.shape) > 1 else 1
+    if test:
+       F = np
+    if family == "gauss":
+        priorxentropy  = np.log( 2 * np.pi * reg_inv_coeff**2 ) * J/2  + 1/2* F.sum(  (z_mean**2 + F.exp(z_logvar) ) / reg_inv_coeff**2 ) / n_samples
+    elif family == "laplace":
+        """
+        math: - \frac{\left( |\mu|  + b \, e^{-\frac{|\mu|}{b}} \right)}{\lambda }  + \log{\left(2 \lambda \right )}
+        """
+        priorxentropy  = ( 1 / reg_inv_coeff * (  F.sum( abs( z_mean ) )  +  F.sum( F.exp(z_logvar) ) * F.exp( - F.sum( abs(z_mean) / F.exp(z_logvar) ) ) ) + \
+                J * np.log( 2 * reg_inv_coeff ) ) / n_samples
+        #return F.sum(z_mean) * 0
+    else:
+        raise ValueError("unknown distribution family:", family )
+    #print(" const", np.log( 2* reg_inv_coeff) * J)
+    #print( "E(|z|/lambda )",   1 / reg_inv_coeff * (  F.sum( abs( z_mean ) ) ).data )
+    return  priorxentropy
 
 
 class ImageAutoEncoder():
@@ -75,7 +181,8 @@ class ImageAutoEncoder():
                  decode_layers=[300, 800, 1000],
                  latent_width=100, rec_kl_ratio=1.0, flag_gpu=None,
                  flag_dropout=False, flag_autocrop=False,
-                 flag_grayscale=False):
+                 flag_grayscale=False, ksize = 3,
+                 stride = 1, bias = 0, nobias = False, wscale = 1 , pad = 0 ):
         '''Setup for the variational auto-encoder.
 
         Inititalizes the layer setup for the NN to the defined dimensions.
@@ -115,6 +222,12 @@ class ImageAutoEncoder():
         self.latent_dim = latent_width
         self.img_width = img_width
         self.img_height = img_height
+        self.ksize = ksize
+        self.stride = stride
+        self.pad = pad
+        self.wscale = wscale
+        self.bias = bias
+        self.nobias = nobias
         if flag_grayscale:
             self.color_channels = 1
         else:
@@ -144,26 +257,28 @@ class ImageAutoEncoder():
         decode_layer_pairs = [(self.latent_dim, self.decode_sizes[0])]
         decode_layer_pairs += list(zip(self.decode_sizes[:-1],
                                   self.decode_sizes[1:]))
-        decode_layer_pairs += [(self.decode_sizes[-1], self.img_len)]
+        """ set number of output pixels as 2 x image pixels to represent mean and variance """
+        decode_layer_pairs += [(self.decode_sizes[-1], self.img_len * 2)]
         for i, (n_in, n_out) in enumerate(decode_layer_pairs):
-            layers['decode_%i' % i] = F.Linear(n_in, n_out)
+           layers['decode_%i' % i] = F.Linear(n_in, n_out)
         model = chainer.FunctionSet(**layers)
         if self.flag_gpu:
             cuda.init()
             model.to_gpu()
         return model
 
-    def _encode(self, img_batch):
+    def _encode(self, img_batch, train = True):
         batch = img_batch
         if self.flag_dropout:
-            batch = F.dropout(batch)
+            batch = F.dropout(batch, ratio = 0.5 if type(self.flag_dropout) is bool else self.flag_dropout , train = train)
         n_layers = len(self.encode_sizes)
         for i in range(n_layers):
-            batch = F.relu(getattr(self.model, 'encode_%i' % i)(batch))
+            batch = getattr(self.model, 'encode_%i' % i)(batch)
+            batch = F.relu(batch)
         batch = F.relu(getattr(self.model, 'encode_%i' % n_layers)(batch))
         return batch
 
-    def _decode(self, latent_vec):
+    def _decode(self, latent_vec, train = True):
         batch = latent_vec
         n_layers = len(self.decode_sizes)
         for i in range(n_layers):
@@ -171,24 +286,79 @@ class ImageAutoEncoder():
         batch = F.sigmoid(getattr(self.model, 'decode_%i' % n_layers)(batch))
         return batch
 
-    def _forward(self, img_batch):
+    def _forward(self, img_batch, train = True, lasso_coeff =1 ):
+        n_samples = img_batch.shape[0] 
         batch = chainer.Variable(img_batch / 255.)
-        encoded = self._encode(batch)
+        encoded = self._encode(batch, train = True)
         # Split latent space into `\mu` and `\sigma` parameters
-        mean, std = F.split_axis(encoded, 2, 1)
-        # Create `latent_dim` N(0,1) normal samples.
-        samples = np.random.standard_normal(mean.data.shape).astype('float32')
-        if self.flag_gpu:
-            samples = cuda.to_gpu(samples)
-        samples = chainer.Variable(samples)
-        # Scale samples to model trained parameters.
-        sample_set = samples * F.exp(0.5*std) + mean
-        output = self._decode(sample_set)
-        reconstruction_loss = F.mean_squared_error(output, batch)
-        # Construct and scale KL Divergence loss.
-        kl_div = -0.5 * F.sum(1 + std - mean ** 2 - F.exp(std))
-        kl_div /= (img_batch.shape[1] * img_batch.shape[0])
-        return reconstruction_loss, kl_div, output
+
+        z_mean, z_logvar = F.split_axis(encoded, 2, 1)
+
+
+        family = "laplace" 
+        #family = "gauss" 
+        def run_decoder_ensemble( z_mean, z_logvar, family = "gauss"):
+            def vprint(*args, **kwargs):
+                # print( *args, **kwargs )
+                pass
+
+            z_set =  random_q_z( z_mean, z_logvar, family = family, flag_gpu = self.flag_gpu )
+
+            ##################################################################################
+            """ Construct and scale KL Divergence loss. """
+            kl_div0 = -0.5 * F.sum(1 + z_logvar - z_mean ** 2 - F.exp(z_logvar))  
+            #kl_div0 /= (img_batch.shape[1] * img_batch.shape[0])
+            vprint( "kl_div [analytical Gaussian]", kl_div0.data)
+
+            "entropy of the variational distribution"
+            qentropy_theor =  analytic_entropy_q_z( z_logvar , family = family )
+            qentropy_emp = emp_entropy_q_z( z_set, z_mean, z_logvar , n_samples, family = family )
+            vprint("qentropy_theor", qentropy_theor.data )
+            vprint("qentropy_emp", qentropy_emp.data )
+            # print( "z_mean", z_mean.data )
+
+            "cross-entropy"
+            priorxentropy_theor= analytic_cross_entropy_prior_z( z_mean, z_logvar , family,  reg_inv_coeff= 1/lasso_coeff  )
+            priorxentropy = emp_cross_entropy_prior_z( z_set, n_samples, reg_inv_coeff= 1/lasso_coeff, family = family )
+            vprint("priorxentropy theor", priorxentropy_theor.data )
+            vprint("priorxentropy", priorxentropy.data )
+            kl_div  =  - qentropy_emp + priorxentropy
+            vprint( "kl_div", kl_div.data)
+            ##################################################################################
+            """Reconstruction"""
+            output = self._decode( z_set, train = True)
+            xo_mean, xo_logvar = F.split_axis(output, 2, 1)
+            ##################################################################################
+            """ Reconstruction Loss """
+            reconstruction_loss = - F.sum( - (batch - xo_mean ) ** 2  * F.exp(-xo_logvar) - 0.5 * (np.log( 2* np.pi) + xo_logvar ) )
+            reconstruction_loss /= n_samples # * np.prod(img_batch.shape[1:])
+
+            vprint("reconstruction loss:", reconstruction_loss.data )
+            #  lasso_term = lasso_coeff * np.absolute(encoded)
+            reconstruction_loss0 = F.mean_squared_error(xo_mean, batch)
+            vprint("reconstruction loss (F):", reconstruction_loss0.data )
+           # loglh_phi_theta = kl_div + loglhx
+            return reconstruction_loss, kl_div , xo_mean
+
+        repeats = 3
+
+        reconstruction_loss = 0
+        kl_div = 0
+        xo_mean = None
+        for rr in range(repeats):
+            loss, kl, xm = run_decoder_ensemble( z_mean, z_logvar, family = family)
+            reconstruction_loss += loss
+            kl_div += kl
+            if xo_mean is None:
+                xo_mean = xm
+            else:
+                xo_mean += xm
+
+        reconstruction_loss /= repeats
+        kl_div /= repeats
+        xo_mean /= repeats
+
+        return reconstruction_loss, kl_div , xo_mean
 
     def load_images(self, files):
         '''Load in image files from list of paths.
@@ -230,6 +400,7 @@ class ImageAutoEncoder():
         self.x_all = np.array([resize(fname) for fname in tqdm.tqdm(files)])
         self.x_all = self.x_all.astype('float32')
         print("Image Files Loaded!")
+        print("shape:", self.x_all.shape)
 
     def fit(self, n_epochs=200, batch_size=100):
         '''Fit the VAE model to the image data.
@@ -301,18 +472,18 @@ class ImageAutoEncoder():
         if not normalized:
             x_encoding /= 255.
         x_encoded = self._encode(x_encoding)
-        mean, std = F.split_axis(x_encoded, 2, 1)
+        mean, logvar = F.split_axis(x_encoded, 2, 1)
         # Create `latent_dim` N(0,1) normal samples.
         samples = np.random.standard_normal(mean.data.shape).astype('float32')
         if self.flag_gpu:
             samples = cuda.to_gpu(samples)
         samples = chainer.Variable(samples)
         # Scale samples to model trained parameters.
-        sample_set = samples * F.exp(0.5*std) + mean
+        sample_set = samples * F.exp(0.5*logvar) + mean
 
         return sample_set.data
 
-    def inverse_transform(self, encoded, normalized=True):
+    def inverse_transform(self, encoded, normalized=True, train = True):
         '''Takes a latent space vector and transforms it into an image.
 
         Parameters
@@ -326,8 +497,9 @@ class ImageAutoEncoder():
 
         '''
         encoded = chainer.Variable(encoded)
-        output = self._decode(encoded)
-        return output.data.reshape((-1, self.img_height, self.img_width, self.color_channels))
+        output = self._decode(encoded, train = train)
+        xo_mean, xo_logvar = F.split_axis(output, 2, 1)
+        return xo_mean.data.reshape((-1, self.img_height, self.img_width, self.color_channels))
 
     def dump(self, filepath):
         '''Saves model as a sequence of files.
